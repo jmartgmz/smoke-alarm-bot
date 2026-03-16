@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Dict, Optional, cast
 
 import discord
@@ -14,6 +16,19 @@ class VoiceTracker:
         self.interval_seconds = interval_seconds
         self.logger = logger
         self._chirp_tasks: Dict[int, asyncio.Task] = {}
+        self._last_chirp_at: Dict[int, float] = {}
+
+    def get_seconds_until_next_chirp(self, guild_id: int) -> float:
+        last_chirp_monotonic = self._last_chirp_at.get(guild_id)
+        if last_chirp_monotonic is not None:
+            return max(0.0, self.interval_seconds - (time.monotonic() - last_chirp_monotonic))
+
+        persisted_last_chirp = self.db.get_last_chirp_at(guild_id)
+        if persisted_last_chirp is None:
+            return 0.0
+
+        elapsed_seconds = (datetime.now(timezone.utc) - persisted_last_chirp).total_seconds()
+        return max(0.0, self.interval_seconds - elapsed_seconds)
 
     async def start_chirp_loop(self, guild_id: int, voice_client: discord.VoiceClient) -> None:
         task = self._chirp_tasks.get(guild_id)
@@ -37,6 +52,11 @@ class VoiceTracker:
                 if not voice_client.is_connected():
                     break
 
+                seconds_until_next = self.get_seconds_until_next_chirp(guild_id)
+                if seconds_until_next > 0:
+                    await asyncio.sleep(seconds_until_next)
+                    continue
+
                 if not voice_client.is_playing():
                     source = discord.FFmpegPCMAudio(
                         self.audio_file,
@@ -44,12 +64,15 @@ class VoiceTracker:
                         options="-loglevel panic",
                     )
                     voice_client.play(source)
+                    self._last_chirp_at[guild_id] = time.monotonic()
+                    self.db.set_last_chirp_at(guild_id)
                     listener_count = self.record_chirp_listeners(guild_id, voice_client)
                     self.logger.info(
                         "Chirp played in guild %s for %s listeners", guild_id, listener_count
                     )
-
-                await asyncio.sleep(self.interval_seconds)
+                else:
+                    # Audio is still in progress; check again soon without resetting cooldown.
+                    await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             self.logger.info("Chirp loop cancelled for guild %s", guild_id)
         finally:

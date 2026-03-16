@@ -1,6 +1,7 @@
 import os
 import sqlite3
 from datetime import datetime, timezone
+from typing import Optional
 
 
 class StatsDatabase:
@@ -34,6 +35,14 @@ class StatsDatabase:
                     event_type TEXT NOT NULL,
                     listened_chirp INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chirp_state (
+                    guild_id INTEGER PRIMARY KEY,
+                    last_chirp_at TEXT NOT NULL
                 )
                 """
             )
@@ -90,6 +99,43 @@ class StatsDatabase:
             conn.commit()
         return int(row[0]) if row else 0
 
+    def set_last_chirp_at(self, guild_id: int) -> None:
+        now_iso = self._utc_now_iso()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO chirp_state (guild_id, last_chirp_at)
+                VALUES (?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    last_chirp_at = excluded.last_chirp_at
+                """,
+                (guild_id, now_iso),
+            )
+            conn.commit()
+
+    def get_last_chirp_at(self, guild_id: int) -> Optional[datetime]:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT last_chirp_at
+                FROM chirp_state
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+
+        if not row:
+            return None
+
+        try:
+            parsed = datetime.fromisoformat(str(row[0]))
+        except ValueError:
+            return None
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
     def get_broke_meter(self, guild_id: int, user_id: int) -> int:
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
@@ -112,6 +158,37 @@ class StatsDatabase:
             ).fetchall()
         return [(int(row[0]), int(row[1])) for row in rows]
 
+    def get_server_leaderboard_page(
+        self,
+        guild_id: int,
+        limit: int,
+        offset: int,
+    ) -> list[tuple[int, int]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, broke_meter
+                FROM user_stats
+                WHERE guild_id = ?
+                ORDER BY broke_meter DESC, last_seen_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (guild_id, limit, offset),
+            ).fetchall()
+        return [(int(row[0]), int(row[1])) for row in rows]
+
+    def get_server_leaderboard_count(self, guild_id: int) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM user_stats
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
     def get_global_leaderboard(self, limit: int) -> list[tuple[int, int, int]]:
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
@@ -125,3 +202,35 @@ class StatsDatabase:
                 (limit,),
             ).fetchall()
         return [(int(row[0]), int(row[1]), int(row[2])) for row in rows]
+
+    def get_global_leaderboard_page(
+        self,
+        limit: int,
+        offset: int,
+    ) -> list[tuple[int, int, int]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, SUM(broke_meter) AS total_broke, COUNT(DISTINCT guild_id) AS guild_count
+                FROM user_stats
+                GROUP BY user_id
+                ORDER BY total_broke DESC, MAX(last_seen_at) DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
+        return [(int(row[0]), int(row[1]), int(row[2])) for row in rows]
+
+    def get_global_leaderboard_count(self) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT user_id
+                    FROM user_stats
+                    GROUP BY user_id
+                ) grouped_users
+                """
+            ).fetchone()
+        return int(row[0]) if row else 0
